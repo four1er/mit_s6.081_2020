@@ -4,6 +4,6 @@ for each lab, you can find it by switch the branch.
 
 or 
 
-`git checkout util`
+`git checkout util` and others.
 
 best wishes.
