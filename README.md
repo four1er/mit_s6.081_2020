@@ -2,4 +2,8 @@
 
 for each lab, you can find it by switch the branch.
 
+or 
+
+`git checkout util`
+
 best wishes.
