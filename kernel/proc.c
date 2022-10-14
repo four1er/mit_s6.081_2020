@@ -31,15 +31,6 @@ procinit(void)
   for(p = proc; p < &proc[NPROC]; p++) {
       initlock(&p->lock, "proc");
 
-      // Allocate a page for the process's kernel stack.
-      // Map it high in memory, followed by an invalid
-      // guard page.
-      char *pa = kalloc();
-      if(pa == 0)
-        panic("kalloc");
-      uint64 va = KSTACK((int) (p - proc));
-      kvmmap(va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
-      p->kstack = va;
   }
   kvminithart();
 }
@@ -121,14 +112,50 @@ found:
     return 0;
   }
 
+  // A kernel page table for process       
+  p->kernel_pagetable =  user_kvminit();
+  // printf("process kernel ptb:%p\n",p->kernel_pagetable);
+  if(p->kernel_pagetable==0){
+    freeproc(p);
+    release(&p->lock);
+    return 0;
+  }                                                                                                                                   
+
+  // Allocate a page for the process's kernel stack.
+  // Map it high in memory, followed by an invalid
+  // guard page.
+  char *pa = kalloc();
+  if(pa == 0)
+    panic("kalloc");
+  uint64 va = KSTACK((int) (p - proc));
+  mappages(p->kernel_pagetable,va, PGSIZE,(uint64)pa,PTE_R | PTE_W);
+  p->kstack = va;
+
+
   // Set up new context to start executing at forkret,
   // which returns to user space.
   memset(&p->context, 0, sizeof(p->context));
   p->context.ra = (uint64)forkret;
   p->context.sp = p->kstack + PGSIZE;
 
+  // printf("alloc process ok!\n");
   return p;
 }
+
+void 
+free_user_kernel_pagetable(pagetable_t pagetable){
+  for(int i=0;i<512;i++){
+    pte_t pte = pagetable[i];
+    if ((pte & PTE_V) && (pte & (PTE_R|PTE_W|PTE_X)) == 0) {
+      uint64 child = PTE2PA(pte);
+      free_user_kernel_pagetable((pagetable_t)child);
+      pagetable[i] = 0;
+	  }
+  }
+  kfree(pagetable);
+}
+
+extern pte_t * walk(pagetable_t pagetable, uint64 va, int alloc);
 
 // free a proc structure and the data hanging from it,
 // including user pages.
@@ -150,6 +177,17 @@ freeproc(struct proc *p)
   p->killed = 0;
   p->xstate = 0;
   p->state = UNUSED;
+
+  if(p->kstack){
+    pte_t* pte = walk(p->kernel_pagetable,p->kstack,0);
+    uint64 pa = (uint64)PTE2PA(*pte);
+    kfree((void*)pa);
+  }
+  if(p->kernel_pagetable){
+    free_user_kernel_pagetable(p->kernel_pagetable);
+    p->kernel_pagetable = 0;
+  }
+
 }
 
 // Create a user page table for a given process,
@@ -221,6 +259,8 @@ userinit(void)
   uvminit(p->pagetable, initcode, sizeof(initcode));
   p->sz = PGSIZE;
 
+  kvmcopy(p->pagetable,p->kernel_pagetable,0,PGSIZE);
+
   // prepare for the very first "return" from kernel to user.
   p->trapframe->epc = 0;      // user program counter
   p->trapframe->sp = PGSIZE;  // user stack pointer
@@ -243,11 +283,18 @@ growproc(int n)
 
   sz = p->sz;
   if(n > 0){
+    if(sz+n>=PLIC){
+      return -1;
+    }
     if((sz = uvmalloc(p->pagetable, sz, sz + n)) == 0) {
+      return -1;
+    }
+    if(kvmcopy(p->pagetable,p->kernel_pagetable,p->sz,sz)==-1){
       return -1;
     }
   } else if(n < 0){
     sz = uvmdealloc(p->pagetable, sz, sz + n);
+    uvmunmap(p->kernel_pagetable,PGROUNDUP(sz), (PGROUNDUP(p->sz) - PGROUNDUP(sz)) / PGSIZE,0);
   }
   p->sz = sz;
   return 0;
@@ -276,6 +323,12 @@ fork(void)
   np->sz = p->sz;
 
   np->parent = p;
+
+  if(kvmcopy(np->pagetable, np->kernel_pagetable, 0, np->sz) < 0){
+    freeproc(np);
+    release(&np->lock);
+    return -1;
+  }
 
   // copy saved user registers.
   *(np->trapframe) = *(p->trapframe);
@@ -446,13 +499,14 @@ wait(uint64 addr)
   }
 }
 
+extern pagetable_t kernel_pagetable;
+
 // Per-CPU process scheduler.
 // Each CPU calls scheduler() after setting itself up.
 // Scheduler never returns.  It loops, doing:
 //  - choose a process to run.
 //  - swtch to start running that process.
-//  - eventually that process transfers control
-//    via swtch back to the scheduler.
+//  - eventually that process transfers control.
 void
 scheduler(void)
 {
@@ -473,6 +527,10 @@ scheduler(void)
         // before jumping back to us.
         p->state = RUNNING;
         c->proc = p;
+        
+        w_satp(MAKE_SATP(p->kernel_pagetable));
+        sfence_vma();
+
         swtch(&c->context, &p->context);
 
         // Process is done running for now.
@@ -485,6 +543,8 @@ scheduler(void)
     }
 #if !defined (LAB_FS)
     if(found == 0) {
+      w_satp(MAKE_SATP(kernel_pagetable));
+      sfence_vma();
       intr_on();
       asm volatile("wfi");
     }
